@@ -31,6 +31,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private RedisIdWorker redisIdWorker;
 
+    // version1: 先查库存，然后库存有就直接加，会引发超卖问题
+    // version2: 利用乐观锁，先查库存，然后update的时候判断此时库存是否发生变化(结合数据库行锁)，不等的话就表示已经变化不能再更新
+    // version3: 版本2的条件太过严苛，其实只要库存大于0就可以添加 -> 版本2和版本3都是将锁下沉至数据库，利用数据库的行锁解决
     @Transactional
     @Override
     public Result seckillVoucher(Long voucherId) {
@@ -55,7 +58,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 此时库存充足，减少库存量，然后创建订单
         boolean success = iSeckillVoucherService.update()
                 .setSql("stock = stock - 1")
-                .eq("voucher_id", voucherId).update();
+                .eq("voucher_id", voucherId)
+//                .eq("stock", voucher.getStock())
+                .gt("stock", 0)
+                .update();
         if (!success){
             // 扣减失败
             return Result.fail("库存不足");
