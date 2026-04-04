@@ -7,14 +7,26 @@ import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
+import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
+import java.util.Collections;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * <p>
@@ -32,9 +44,93 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private RedisIdWorker redisIdWorker;
 
+    @Resource
+    private RedissonClient redissonClient;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    private static final DefaultRedisScript<Long> SECKILL_SCRIPT = new DefaultRedisScript<>();
+
+    static {
+        SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua")); // 设置脚本路径
+        SECKILL_SCRIPT.setResultType(Long.class); // 设置返回类型
+    }
+
+    // JVM阻塞队列
+    private BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024 * 1024);
+
+    // 线程池 —— 完成下单任务落库
+    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+
+    // 代理对象
+    private IVoucherOrderService proxy;
+
+    private class VoucherOrderHandler implements Runnable {
+        @Override
+        public void run() {
+            while (true) {
+                try {
+                    VoucherOrder voucherOrder = orderTasks.take();
+                    // 去执行落库操作
+                    handleVoucherOrder(voucherOrder);
+                } catch (InterruptedException e) {
+                    log.error("处理订单异常", e);
+                }
+            }
+        }
+    }
+
+    private void handleVoucherOrder(VoucherOrder voucherOrder) {
+        proxy.createVoucherOrder(voucherOrder);
+    }
+
+    @PostConstruct
+    private void init() {
+        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+    }
+
+    @Override
+    public Result seckillVoucher(Long voucherId) {
+        // 1. 秒杀是否结束
+        SeckillVoucher voucher = iSeckillVoucherService.getById(voucherId);
+        if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+            // 此时秒杀没有开始
+            return Result.fail("秒杀尚未开始");
+        }
+        if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+            // 此时秒杀已经结束了
+            return Result.fail("秒杀已经结束");
+        }
+
+        // 2. lua脚本判断是否拥有下单资格
+        Long userId = UserHolder.getUser().getId();
+        Long result = stringRedisTemplate.execute(SECKILL_SCRIPT, Collections.emptyList(), voucherId.toString(), userId.toString());
+        // 3. 根据结果来构建返回结果，如果有则异步下单
+        int r = result.intValue();
+        if (r != 0) {
+            // 3.1 无法下单
+            return Result.fail(r == 1 ? "库存不足" : "单用户不能重复下单");
+        }
+
+        // 3.2 有下单资格，此时直接返回OrderID
+        long orderId = redisIdWorker.nextId("order");
+
+        // TODO: 异步下单，任务放入阻塞队列，后续由线程池中的线程去完成
+        VoucherOrder voucherOrder = new VoucherOrder();
+        voucherOrder.setId(orderId);
+        voucherOrder.setUserId(userId);
+        voucherOrder.setVoucherId(voucherId);
+        orderTasks.add(voucherOrder);
+        // 拿到代理对象
+        proxy = (IVoucherOrderService) AopContext.currentProxy();
+        return Result.ok(orderId);
+    }
+
     // version1: 先查库存，然后库存有就直接加，会引发超卖问题
     // version2: 利用乐观锁，先查库存，然后update的时候判断此时库存是否发生变化(结合数据库行锁)，不等的话就表示已经变化不能再更新
     // version3: 版本2的条件太过严苛，其实只要库存大于0就可以添加 -> 版本2和版本3都是将锁下沉至数据库，利用数据库的行锁解决
+/*
     @Override
     public Result seckillVoucher(Long voucherId) {
         // 1. 查询优惠券
@@ -57,12 +153,30 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         Long userId = UserHolder.getUser().getId();
-        synchronized (userId.toString().intern()) {
-            // Spring官方不推荐这个方法，建议的是拆Service，然后在这里面注入Service
+
+        // 使用Redisson分布式锁，不指定参数，直接使用看门狗机制
+        RLock lock = redissonClient.getLock(RedisConstants.LOCK_ORDER_KEY + userId);
+        boolean isLock = lock.tryLock();
+
+        if (!isLock){
+            // 获取锁失败，返回错误或重试
+            return Result.fail("不允许重复下单");
+        }
+        try {
+            // 获取代理对象，使得相应逻辑走事务
             IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
             return proxy.createVoucherOrder(voucherId);
+        } finally {
+            lock.unlock();
         }
+
+//        synchronized (userId.toString().intern()) {
+//            // Spring官方不推荐这个方法，建议的是拆Service，然后在这里面注入Service
+//            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+//            return proxy.createVoucherOrder(voucherId);
+//        }
     }
+*/
 
     // 一人一单实现问题: 不加锁的时候多个线程进来会都查到没有购买，然后统一进行购买，于是一个用户还是多买了
     // 对userId加锁，此时不再使用乐观锁而是悲观锁，可是userId.toString()单独不能保证因为它是一个新对象，我们需要对常量池中的进行加锁
@@ -104,5 +218,22 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
         // 7. 返回订单ID
         return Result.ok(orderId);
+    }
+
+    @Transactional
+    public void createVoucherOrder(VoucherOrder voucherOrder) {
+        // 此时这里的voucherOrder是从阻塞队列里面拿的，已经封装好了的
+        boolean success = iSeckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherOrder.getVoucherId())
+                .gt("stock", 0)
+                .update();
+        if (!success) {
+            // 扣减失败
+            log.error("库存扣减失败");
+            return ;
+        }
+
+        save(voucherOrder);
     }
 }
