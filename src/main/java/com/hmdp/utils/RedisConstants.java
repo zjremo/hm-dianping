@@ -7,7 +7,8 @@ public class RedisConstants {
     public static final Long LOGIN_CODE_TTL = 2L;
     // 用户登录信息有效期 30分钟
     public static final String LOGIN_USER_KEY = "login:token:";
-    public static final Long LOGIN_USER_TTL = 30L;
+//    public static final Long LOGIN_USER_TTL = 30L;
+    public static final Long LOGIN_USER_TTL = 300L;
 
     public static final Long CACHE_NULL_TTL = 2L;
 

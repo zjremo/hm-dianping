@@ -40,7 +40,27 @@ public class RedisIdWorker {
         return timeStamp << COUNT_BITS | count;
     }
 
-//    public static void main(String[] args) {
+    public RedisOrderIdNeed nextIdNeed(String keyPrefix){
+        // 1. 生成时间戳
+        LocalDateTime now = LocalDateTime.now();
+        long nowSecond = now.toEpochSecond(ZoneOffset.UTC);
+        long timeStamp = nowSecond - BEGIN_TIMESTAMP;
+
+        // 2. 组装redis的orderIdKey
+        String date = now.format(DateTimeFormatter.ofPattern("yyyy:MM:dd"));
+        String orderIDKey = "icr:" + keyPrefix + date;
+        return new RedisOrderIdNeed(timeStamp, orderIDKey);
+    }
+
+    public long nextId(long timeStamp, long count){
+        return timeStamp << COUNT_BITS | count;
+    }
+
+    public static long getCountBits() {
+        return COUNT_BITS;
+    }
+
+    //    public static void main(String[] args) {
 //        LocalDateTime localDateTime = LocalDateTime.of(2022, 1, 1, 0, 0, 0);
 //        long seconds = localDateTime.toEpochSecond(ZoneOffset.UTC);
 //        log.debug("seconds = {}", seconds);

@@ -3,6 +3,10 @@
 local voucherID = ARGV[1]
 -- 1.2 userID
 local userID = ARGV[2]
+-- 1.3 订单ID key
+local orderIDKey = ARGV[3]
+-- 1.4 当前时间戳
+local timeStamp = ARGV[4]
 
 -- 2. keys
 -- 2.1 库存key
@@ -27,4 +31,9 @@ end
 -- 3.3 拥有了下单资格现在，开始扣减库存和添加下单用户
 redis.call('incrby', stockKey, -1)
 redis.call('sadd', orderKey, userID)
-return 0
+-- 4. 将订单加入stream消息队列中
+-- 不想丢失orderId的全局统计自增意义，这里我存进去一个count，后续的时间戳稍微延时一点不是那么重要
+local count = redis.call('incr', orderIDKey)
+redis.call('xadd', 'stream.orders', '*', 'userId', userID, 'voucherId', voucherID, 'count', count, 'timeStamp', timeStamp)
+-- 如果成功，我们认为最终结果是>=3的，其中为3 + count
+return 3 + count
